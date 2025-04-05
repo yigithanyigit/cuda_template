@@ -9,43 +9,24 @@
 // Sample kernels to demonstrate the template use
 
 // Example kernel for reduction (sum)
-template<unsigned int blockSize>
-__global__ void reduceKernel(const float* input, float* output, size_t n) {
-    extern __shared__ float sdata[];
+__global__ void reduceSharedSumKernel(const float *a, float *b, size_t n) {
+    uint tid = threadIdx.x;
+    int i = blockDim.x * blockIdx.x + tid;
     
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockSize * 2 + tid;
-    unsigned int gridSize = blockSize * 2 * gridDim.x;
+    extern __shared__ float sdata[]; // Should be equal to the total number of threads.
     
-    // Load and perform first level of reduction
-    float sum = 0.0f;
-    while (i < n) {
-        sum += input[i];
-        if (i + blockSize < n)
-            sum += input[i + blockSize];
-        i += gridSize;
-    }
-    
-    sdata[tid] = sum;
+    sdata[tid] = (i < n) ? a[i] : 0.0f;
     __syncthreads();
     
-    // Reduction within the block
-    if (blockSize >= 512) { if (tid < 256) { sdata[tid] += sdata[tid + 256]; } __syncthreads(); }
-    if (blockSize >= 256) { if (tid < 128) { sdata[tid] += sdata[tid + 128]; } __syncthreads(); }
-    if (blockSize >= 128) { if (tid < 64) { sdata[tid] += sdata[tid + 64]; } __syncthreads(); }
-    
-    // Last 64 threads handled differently (to avoid unnecessary __syncthreads)
-    if (tid < 32) {
-        if (blockSize >= 64) sdata[tid] += sdata[tid + 32];
-        if (blockSize >= 32) sdata[tid] += sdata[tid + 16];
-        if (blockSize >= 16) sdata[tid] += sdata[tid + 8];
-        if (blockSize >= 8) sdata[tid] += sdata[tid + 4];
-        if (blockSize >= 4) sdata[tid] += sdata[tid + 2];
-        if (blockSize >= 2) sdata[tid] += sdata[tid + 1];
+    for (uint offset = blockDim.x / 2; offset > 0 && tid < offset; offset >>= 1) {
+        sdata[tid] += sdata[tid + offset];
+        __syncthreads();
     }
     
-    // Write result for this block
-    if (tid == 0) output[blockIdx.x] = sdata[0];
+    // Write result for this block to global memory
+    if (tid == 0) {
+        b[blockIdx.x] = sdata[0];
+    }
 }
 
 // Example kernel using shuffle instructions (warp-level reduction)
@@ -112,6 +93,7 @@ int main(int argc, char** argv) {
     // Allocate host memory
     float* h_input = new float[n];
     float* h_output = new float[n];
+    float* h_vec_output = new float[n];
     
     // Initialize input data
     for (size_t i = 0; i < n; i++) {
@@ -119,9 +101,10 @@ int main(int argc, char** argv) {
     }
     
     // Allocate device memory
-    float *d_input, *d_output;
+    float *d_input, *d_output, *d_vec_output;
     CUDA_CHECK(cudaMalloc(&d_input, bytes));
     CUDA_CHECK(cudaMalloc(&d_output, bytes));
+    CUDA_CHECK(cudaMalloc(&d_vec_output, bytes));
     
     // Copy input data to device
     CUDA_CHECK(cudaMemcpy(d_input, h_input, bytes, cudaMemcpyHostToDevice));
@@ -136,18 +119,81 @@ int main(int argc, char** argv) {
     
     std::cout << "\nRunning reduction kernel examples...\n";
     
-    // Run basic reduction benchmark
-    benchmark.run("Basic Reduction", [&]() {
-        launchKernel<decltype(reduceKernel<blockSize>)>(
-            reduceKernel<blockSize>,
+    // Setup throughput calculators for different kernel types
+    ReductionThroughputData reductionCalc;
+    reductionCalc.dataSize = bytes;
+    
+    ElementWiseThroughputData vecAddCalc(3); // 3 arrays: 2 input, 1 output
+    vecAddCalc.dataSize = bytes;
+    
+    // Run and verify basic reduction
+    std::cout << "\n--- CORRECTNESS VERIFICATION ---\n";
+        
+    // Clear output buffer
+    CUDA_CHECK(cudaMemset(d_output, 0, bytes));
+    
+    // Run shared memory reduction kernel
+    launchKernel<decltype(reduceSharedSumKernel)>(
+        reduceSharedSumKernel,
+        gridSize, blockSize, smemSize, 0,
+        "reduceSharedSumKernel", true,
+        d_input, d_output, n
+    );
+    
+    // Copy results back to verify
+    CUDA_CHECK(cudaMemcpy(h_output, d_output, gridSize * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Verify shared memory reduction results
+    verifyReductionResults(h_output, h_input, n, gridSize, "reduceSharedSumKernel");
+    
+    // Clear output buffer
+    CUDA_CHECK(cudaMemset(d_output, 0, bytes));
+    
+    // Run shuffle-based reduction kernel
+    launchKernel<decltype(reduceShuffleKernel)>(
+        reduceShuffleKernel,
+        gridSize, blockSize, blockSize * sizeof(float) / 32, 0,
+        "reduceShuffleKernel", true,
+        d_input, d_output, n
+    );
+    
+    // Copy results back to verify
+    CUDA_CHECK(cudaMemcpy(h_output, d_output, gridSize * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // Verify shuffle reduction results
+    verifyReductionResults(h_output, h_input, n, gridSize, "reduceShuffleKernel");
+    
+    // Clear output buffer
+    CUDA_CHECK(cudaMemset(d_vec_output, 0, bytes));
+    
+    // Run vector addition kernel
+    launchKernel<decltype(vecAddKernel)>(
+        vecAddKernel,
+        gridSize, blockSize, 0, 0,
+        "vecAddKernel", true,
+        d_input, d_input, d_vec_output, n
+    );
+    
+    // Copy results back to verify
+    CUDA_CHECK(cudaMemcpy(h_vec_output, d_vec_output, bytes, cudaMemcpyDeviceToHost));
+    
+    // Verify vector add results
+    verifyVectorAddResults(h_vec_output, h_input, h_input, n, "vecAddKernel");
+    
+    std::cout << "\n--- PERFORMANCE BENCHMARKING ---\n";
+    
+    // Run shared memory reduction benchmark
+    benchmark.run("Shared Memory Reduction", [&]() {
+        launchKernel<decltype(reduceSharedSumKernel)>(
+            reduceSharedSumKernel,
             gridSize, blockSize, smemSize, 0,
-            "reduceKernel", false,
+            "reduceSharedSumKernel", false,
             d_input, d_output, n
         );
-    }, 5, bytes, true);
+    }, reductionCalc, 5, true);
     
     // Set this as the baseline for speedup comparisons
-    benchmark.setBaseline("Basic Reduction");
+    benchmark.setBaseline("Shared Memory Reduction");
     
     // Run shuffle-based reduction benchmark
     benchmark.run("Shuffle Reduction", [&]() {
@@ -157,17 +203,17 @@ int main(int argc, char** argv) {
             "reduceShuffleKernel", false,
             d_input, d_output, n
         );
-    }, 5, bytes, true);
+    }, reductionCalc, 5, true);
     
     // Vector addition (just as another example)
     benchmark.run("Vector Addition", [&]() {
         launchKernel<decltype(vecAddKernel)>(
             vecAddKernel,
-            gridSize, blockSize,
-            0, 0, "vecAddKernel", false,
-            d_input, d_input, d_output, n
+            gridSize, blockSize, 0, 0,
+            "vecAddKernel", false,
+            d_input, d_input, d_vec_output, n
         );
-    }, 5, bytes * 3, true);
+    }, vecAddCalc, 5, true);
     
     // Print benchmark results
     benchmark.printResults(true, true);
@@ -175,8 +221,10 @@ int main(int argc, char** argv) {
     // Free memory
     CUDA_CHECK(cudaFree(d_input));
     CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_vec_output));
     delete[] h_input;
     delete[] h_output;
+    delete[] h_vec_output;
     
     // Reset device
     CUDA_CHECK(cudaDeviceReset());

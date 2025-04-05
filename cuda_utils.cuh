@@ -3,6 +3,7 @@
 #include <iostream>
 #include <stdio.h>
 #include <cuda_runtime.h>
+#include <cmath>
 
 #define CUDA_CHECK(call) \
 do { \
@@ -14,6 +15,29 @@ do { \
     } \
 } while(0)
 
+struct ThroughputData {
+    size_t dataSize;    // Size in bytes
+    float time_ms;      // Time in milliseconds
+    
+    virtual float calculate() const {
+        return (dataSize / (1024.0f * 1024.0f * 1024.0f)) / (time_ms / 1000.0f);
+    }
+};
+
+struct ReductionThroughputData : public ThroughputData {
+};
+
+struct ElementWiseThroughputData : public ThroughputData {
+    int numArraysAccessed;
+    
+    ElementWiseThroughputData(int numArrays = 2) : numArraysAccessed(numArrays) {}
+    
+    float calculate() const override {
+        return (numArraysAccessed * dataSize / (1024.0f * 1024.0f * 1024.0f)) / (time_ms / 1000.0f);
+    }
+};
+
+// Simple timer for CPU measurements
 class CPUTimer {
 private:
     std::chrono::high_resolution_clock::time_point start_time;
@@ -42,7 +66,6 @@ public:
     }
 };
 
-// GPU Event timer
 class GPUTimer {
 private:
     cudaEvent_t start_event, stop_event;
@@ -98,4 +121,92 @@ void launchKernel(
     }
     
     CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename T>
+T computeSumGroundTruth(const T* data, size_t n) {
+    T sum = 0;
+    for (size_t i = 0; i < n; i++) {
+        sum += data[i];
+    }
+    return sum;
+}
+
+template<typename T>
+void computeVecAddGroundTruth(const T* a, const T* b, T* result, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        result[i] = a[i] + b[i];
+    }
+}
+
+template<typename T>
+bool verifyReductionResults(T* gpu_result, const T* input, size_t n, int numBlocks, const char* kernelName) {
+    T cpuSum = computeSumGroundTruth(input, n);
+    
+    T gpuSum = 0;
+    for (int i = 0; i < numBlocks; i++) {
+        gpuSum += gpu_result[i];
+    }
+    
+    bool correct = true;
+    if constexpr (std::is_floating_point_v<T>) {
+        float relError = std::abs((cpuSum - gpuSum) / cpuSum);
+        correct = relError < 1e-5;
+        if (!correct) {
+            printf("Kernel '%s' validation failed! CPU sum: %f, GPU sum: %f, relative error: %e\n", 
+                   kernelName, (float)cpuSum, (float)gpuSum, relError);
+        } else {
+            printf("Kernel '%s' validation passed. Sum: %f\n", kernelName, (float)gpuSum);
+        }
+    } else {
+        correct = cpuSum == gpuSum;
+        if (!correct) {
+            printf("Kernel '%s' validation failed! CPU sum: %lld, GPU sum: %lld\n", 
+                   kernelName, (long long)cpuSum, (long long)gpuSum);
+        } else {
+            printf("Kernel '%s' validation passed. Sum: %lld\n", kernelName, (long long)gpuSum);
+        }
+    }
+    
+    return correct;
+}
+
+template<typename T>
+bool verifyVectorAddResults(const T* gpu_result, const T* a, const T* b, size_t n, const char* kernelName) {
+    T* cpu_result = new T[n];
+    
+    computeVecAddGroundTruth(a, b, cpu_result, n);
+    
+    bool correct = true;
+    size_t errorCount = 0;
+    for (size_t i = 0; i < n && errorCount < 10; i++) {
+        if constexpr (std::is_floating_point_v<T>) {
+            if (std::abs(gpu_result[i] - cpu_result[i]) > 1e-5) {
+                if (errorCount == 0) {
+                    printf("Vector add validation failed at index %zu! GPU: %f, CPU: %f\n", 
+                           i, (float)gpu_result[i], (float)cpu_result[i]);
+                }
+                correct = false;
+                errorCount++;
+            }
+        } else {
+            if (gpu_result[i] != cpu_result[i]) {
+                if (errorCount == 0) {
+                    printf("Vector add validation failed at index %zu! GPU: %lld, CPU: %lld\n", 
+                           i, (long long)gpu_result[i], (long long)cpu_result[i]);
+                }
+                correct = false;
+                errorCount++;
+            }
+        }
+    }
+    
+    if (correct) {
+        printf("Kernel '%s' validation passed.\n", kernelName);
+    } else {
+        printf("Kernel '%s' validation failed! Found %zu errors.\n", kernelName, errorCount);
+    }
+    
+    delete[] cpu_result;
+    return correct;
 }

@@ -5,6 +5,7 @@
 #include <string>
 #include <functional>
 #include <algorithm>
+#include <memory>
 #include "cuda_utils.cuh"
 
 struct BenchmarkResult {
@@ -22,10 +23,15 @@ private:
 public:
     Benchmark() : baselineName("") {}
 
-    template<typename Func>
-    BenchmarkResult run(const std::string& name, Func func, int iterations = 10, 
-                      size_t dataSize = 0, bool warmup = true) {
-        
+    template<typename Func, typename ThroughputCalculator>
+    BenchmarkResult run(
+        const std::string& name, 
+        Func func, 
+        ThroughputCalculator& calculator,
+        int iterations = 10, 
+        bool warmup = true) 
+    {
+        // Optional warmup run
         if (warmup) {
             func();
             CUDA_CHECK(cudaDeviceSynchronize());
@@ -42,13 +48,57 @@ public:
         timer.stop();
         
         float time_ms = timer.elapsed() / iterations;
-        float throughput = 0.0f;
         
-        if (dataSize > 0) {
-            throughput = (dataSize / (1024.0f * 1024.0f * 1024.0f)) / (time_ms / 1000.0f);
-        }
+        calculator.time_ms = time_ms;
+        
+        float throughput = calculator.calculate();
         
         BenchmarkResult result = {name, time_ms, throughput, 0.0f};
+        results.push_back(result);
+        
+        return result;
+    }
+    
+    template<typename Func>
+    BenchmarkResult run(
+        const std::string& name, 
+        Func func, 
+        size_t dataSize,
+        int iterations = 10, 
+        bool warmup = true) 
+    {
+        ThroughputData calculator;
+        calculator.dataSize = dataSize;
+        
+        return run(name, func, calculator, iterations, warmup);
+    }
+    
+    template<typename Func>
+    BenchmarkResult run(
+        const std::string& name, 
+        Func func,
+        int iterations = 10, 
+        bool warmup = true) 
+    {
+        // Optional warmup run
+        if (warmup) {
+            func();
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        
+        GPUTimer timer;
+        timer.start();
+        
+        for (int i = 0; i < iterations; i++) {
+            func();
+        }
+        
+        CUDA_CHECK(cudaDeviceSynchronize());
+        timer.stop();
+        
+        float time_ms = timer.elapsed() / iterations;
+        
+        BenchmarkResult result = {name, time_ms, 0.0f, 0.0f};
         results.push_back(result);
         
         return result;
